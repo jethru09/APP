@@ -1,0 +1,5 @@
+flask
+flask_mysqldb
+python-dotenv
+# optional: mysqlclient (requires system libs like mariadb or mysql client headers)
+# mysqlclient

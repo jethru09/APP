@@ -2,15 +2,25 @@ from flask import Flask, redirect, url_for, render_template, request, session, f
 from datetime import timedelta
 from flask_mysqldb import MySQL
 from flask import jsonify
-import hashlib 
+import hashlib
+import os
+from dotenv import load_dotenv
+
+# Load .env from the app directory (python-dotenv). Environment variables take precedence.
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 app = Flask(__name__)
-app.secret_key = "HolaCopa"
-app.permanent_session_lifetime = timedelta(minutes= 30)
-app.config['MYSQL_HOST'] = 'localhost'
-app.config['MYSQL_USER'] = 'root'
-app.config['MYSQL_PASSWORD'] = 'Jethru24'
-app.config['MYSQL_DB'] = 'octacore'
+
+# Secrets and DB config come from environment variables or .env
+app.secret_key = os.environ.get('FLASK_SECRET_KEY') or os.environ.get('SECRET_KEY') or os.urandom(24)
+app.permanent_session_lifetime = timedelta(minutes=30)
+app.config['MYSQL_HOST'] = os.environ.get('MYSQL_HOST', 'localhost')
+app.config['MYSQL_USER'] = os.environ.get('MYSQL_USER', 'root')
+app.config['MYSQL_PASSWORD'] = os.environ.get('MYSQL_PASSWORD')
+app.config['MYSQL_DB'] = os.environ.get('MYSQL_DB', 'octacore')
+
+if not app.config['MYSQL_PASSWORD']:
+    raise RuntimeError('Missing MySQL password: set MYSQL_PASSWORD in environment or create a .env file next to t2.py')
 
 mysql = MySQL(app)
 @app.route("/")
@@ -113,20 +123,23 @@ def insert():
 
     if request.method == 'POST':
         table_name = request.form['table_name']
+        if table_name not in tables:
+            cur.close()
+            return jsonify({"success": False, "message": "Invalid table name."})
         attribute_values = request.form.getlist('attribute_values[]')
 
         # Fetch attribute names for the selected table
         cur.execute(f"SHOW COLUMNS FROM {table_name}")
         attributes = [column[0] for column in cur.fetchall()]
 
-        values = [f"'{value}'" for value in attribute_values if value]
+        values = [value for value in attribute_values if value]
         attributes = [attributes[i] for i, value in enumerate(attribute_values) if value]
 
         if values:
-            values_str = ', '.join(values)
+            placeholders = ', '.join(['%s'] * len(values))
             attributes_str = ', '.join(attributes)
-            query = f"INSERT INTO {table_name} ({attributes_str}) VALUES ({values_str})"
-            cur.execute(query)
+            query = f"INSERT INTO {table_name} ({attributes_str}) VALUES ({placeholders})"
+            cur.execute(query, tuple(values))
             mysql.connection.commit()
             cur.close()
 
@@ -158,22 +171,35 @@ def delete():
 
     if request.method == 'POST':
         table_name = request.form['table_name']
+        if table_name not in tables:
+            cur.close()
+            return jsonify({"success": False, "message": "Invalid table name."})
         attribute_names = request.form.getlist('attribute_names[]')
         attribute_values = request.form.getlist('attribute_values[]')
 
-        conditions = [f"{name} = '{value}'" for name, value in zip(attribute_names, attribute_values) if value]
+        params = []
+        conditions = []
+        for name, value in zip(attribute_names, attribute_values):
+            if value:
+                conditions.append(f"{name} = %s")
+                params.append(value)
+
         if conditions:
             condition_str = ' AND '.join(conditions)
             cur.execute(f"LOCK TABLES {table_name} WRITE")
 
             query = f"DELETE FROM {table_name} WHERE {condition_str}"
-            cur.execute(query)
-            mysql.connection.commit()
-
-            cur.execute("UNLOCK TABLES")
-            cur.close()
-
-            return jsonify({"success": True})
+            cur.execute(query, tuple(params))
+            
+            if cur.rowcount > 0:
+                mysql.connection.commit()
+                cur.execute("UNLOCK TABLES")
+                cur.close()
+                return jsonify({"success": True})
+            else:
+                cur.execute("UNLOCK TABLES")
+                cur.close()
+                return jsonify({"success": False, "message": "No matching rows found to delete."})
         else:
             cur.close()
             return jsonify({"success": False, "message": "No attributes provided for deletion."})
@@ -201,18 +227,28 @@ def update():
 
     if request.method == 'POST':
         table_name = request.form['table_name']
+        if table_name not in tables:
+            cur.close()
+            return jsonify({"success": False, "message": "Invalid table name."})
         attribute_names = request.form.getlist('attribute_names[]')
         attribute_values = request.form.getlist('attribute_values[]')
         update_attribute = request.form['update_attribute']
         update_value = request.form['update_value']
 
-        conditions = [f"{name} = '{value}'" for name, value in zip(attribute_names, attribute_values) if value]
+        params = []
+        conditions = []
+        for name, value in zip(attribute_names, attribute_values):
+            if value:
+                conditions.append(f"{name} = %s")
+                params.append(value)
+
         if conditions:
             condition_str = ' AND '.join(conditions)
 
             cur.execute(f"LOCK TABLES {table_name} WRITE")
-            query = f"UPDATE {table_name} SET {update_attribute} = '{update_value}' WHERE {condition_str}"
-            cur.execute(query)
+            query = f"UPDATE {table_name} SET {update_attribute} = %s WHERE {condition_str}"
+            params.insert(0, update_value)  # Insert update_value at the beginning
+            cur.execute(query, tuple(params))
             mysql.connection.commit()
             cur.execute(f"UNLOCK TABLES")
 
@@ -246,6 +282,13 @@ def rename():
     if request.method == 'POST':
         old_table_name = request.form['old_table_name']
         new_table_name = request.form['new_table_name']
+        
+        # Validate table names against allowed tables
+        cur.execute("SHOW TABLES")
+        allowed_tables = [table[0] for table in cur.fetchall() if table[0] != 'users']
+        if old_table_name not in allowed_tables or new_table_name in ['users'] or not new_table_name:
+            cur.close()
+            return jsonify({"success": False, "message": "Invalid table names."})
         
         try:
             cur.execute(f"LOCK TABLES {old_table_name} WRITE")
@@ -326,17 +369,34 @@ def usage(table_name):
         return redirect(url_for("user"))
     
     cur = mysql.connection.cursor()
+    
+    # Validate table name
+    cur.execute("SHOW TABLES")
+    allowed_tables = [table[0] for table in cur.fetchall() if table[0] != 'users']
+    if table_name not in allowed_tables:
+        cur.close()
+        flash("Invalid table name.")
+        return redirect(url_for("use"))
+    
     cur.execute(f"SHOW COLUMNS FROM {table_name}")
     attributes = [column[0] for column in cur.fetchall()]
 
     if request.method == 'POST':
-        query = f"SELECT * FROM {table_name} WHERE "
+        conditions = []
+        params = []
         for attribute in attributes:
             value = request.form.get(attribute)
             if value:
-                query += f"{attribute}='{value}' AND "
-        query = query.rstrip(' AND ')
-        cur.execute(query)
+                conditions.append(f"{attribute} = %s")
+                params.append(value)
+        
+        if conditions:
+            condition_str = ' AND '.join(conditions)
+            query = f"SELECT * FROM {table_name} WHERE {condition_str}"
+            cur.execute(query, tuple(params))
+        else:
+            cur.execute(f"SELECT * FROM {table_name}")
+        
         records = cur.fetchall()
     else:
         cur.execute(f"SELECT * FROM {table_name}")
@@ -360,19 +420,25 @@ def relations():
     return render_template('relations.html')
 
 
-@app.route('/get_attributes', methods=['GET'])
-def get_attributes():
-    table_name = request.args.get('table_name')
+    if request.method == 'POST':
+        table_name = request.args.get('table_name')
+        if not table_name:
+            return jsonify({'attributes': []})
+        
+        # Validate table name
+        cur.execute("SHOW TABLES")
+        allowed_tables = [table[0] for table in cur.fetchall()]
+        if table_name not in allowed_tables:
+            cur.close()
+            return jsonify({'attributes': []})
 
-    cur = mysql.connection.cursor()
+        # Fetch attribute names for the selected table
+        cur.execute(f"SHOW COLUMNS FROM {table_name}")
+        attributes = [column[0] for column in cur.fetchall()]
 
-    # Fetch attribute names for the selected table
-    cur.execute(f"SHOW COLUMNS FROM {table_name}")
-    attributes = [column[0] for column in cur.fetchall()]
+        cur.close()
 
-    cur.close()
-
-    return jsonify({'attributes': attributes})
+        return jsonify({'attributes': attributes})
 
 if __name__ == "__main__":
     app.run(debug = True)
