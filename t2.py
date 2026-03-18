@@ -439,6 +439,20 @@ def relations():
         cur.close()
 
         return jsonify({'attributes': attributes})
+    
+@app.route('/get_attributes', methods=['GET'])
+def get_attributes():
+    table_name = request.args.get('table_name')
+
+    cur = mysql.connection.cursor()
+
+    # Fetch attribute names for the selected table
+    cur.execute(f"SHOW COLUMNS FROM {table_name}")
+    attributes = [column[0] for column in cur.fetchall()]
+
+    cur.close()
+
+    return jsonify({'attributes': attributes})
 
 if __name__ == "__main__":
     app.run(debug = True)
